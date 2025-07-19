@@ -1,0 +1,745 @@
+//+------------------------------------------------------------------+
+//|             SmartScalperPro.mq5 - by DroneQuad (Institusi)       |
+//+------------------------------------------------------------------+
+#property indicator_chart_window
+#property indicator_buffers 10
+#property indicator_plots   2
+
+#include <Trade\Trade.mqh>
+CTrade trade;
+
+// --- Input Settings ---
+input string  TradeSymbol       = "";  // Kosongkan untuk gunakan symbol chart
+input double  RiskRR            = 1.0;
+input double  RRRatio           = 2.0;
+input int     SessionBoxHeight  = 80;
+input color   OBBoxColor        = clrRed;
+input color   FVGBoxColor       = clrBlue;
+input bool    EnableAlerts      = true;
+input bool    EnablePushNotif   = true;
+input ENUM_TIMEFRAMES HTF = PERIOD_H1; // TF untuk filter
+input bool EnableSniperMode = true;
+input bool EnableNormalMode = true;
+input bool EnableInstitutionalMode = false;
+
+// --- Indicator Plot 1: Buy Signal ---
+#property indicator_label1  "Buy Signal"
+#property indicator_type1   DRAW_ARROW
+#property indicator_color1  clrLime
+#property indicator_width1  2
+#property indicator_style1  STYLE_SOLID
+
+// --- Indicator Plot 2: Sell Signal ---
+#property indicator_label2  "Sell Signal"
+#property indicator_type2   DRAW_ARROW
+#property indicator_color2  clrRed
+#property indicator_width2  2
+#property indicator_style2  STYLE_SOLID
+
+// --- Buffers ---
+double BuyBuffer[];
+double SellBuffer[];
+double BoSBuffer[];
+double ChoCHBuffer[];
+double EQHBuffer[];
+double EQLBuffer[];
+double SweepHighBuffer[];
+double SweepLowBuffer[];
+double BuySignalBuffer[];
+double SellSignalBuffer[];
+
+// --- Tracking Waktu Terakhir Sinyal ---
+datetime lastBuyTime = 0;
+datetime lastSellTime = 0;
+
+//+------------------------------------------------------------------+
+//| Custom indicator initialization function                         |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   // Set index buffers
+   SetIndexBuffer(0, BuyBuffer, INDICATOR_DATA);
+   SetIndexBuffer(1, SellBuffer, INDICATOR_DATA);
+   SetIndexBuffer(2, BoSBuffer, INDICATOR_CALCULATIONS);
+   SetIndexBuffer(3, ChoCHBuffer, INDICATOR_CALCULATIONS);
+   SetIndexBuffer(4, EQHBuffer, INDICATOR_CALCULATIONS);
+   SetIndexBuffer(5, EQLBuffer, INDICATOR_CALCULATIONS);
+   SetIndexBuffer(6, SweepHighBuffer, INDICATOR_CALCULATIONS);
+   SetIndexBuffer(7, SweepLowBuffer, INDICATOR_CALCULATIONS);
+   SetIndexBuffer(8, BuySignalBuffer, INDICATOR_CALCULATIONS);
+   SetIndexBuffer(9, SellSignalBuffer, INDICATOR_CALCULATIONS);
+
+   // Set arrow codes for buy/sell signals
+   PlotIndexSetInteger(0, PLOT_ARROW, 233); // Up arrow
+   PlotIndexSetInteger(1, PLOT_ARROW, 234); // Down arrow
+
+   // Set as series
+   ArraySetAsSeries(BuyBuffer, true);
+   ArraySetAsSeries(SellBuffer, true);
+   ArraySetAsSeries(BoSBuffer, true);
+   ArraySetAsSeries(ChoCHBuffer, true);
+   ArraySetAsSeries(EQHBuffer, true);
+   ArraySetAsSeries(EQLBuffer, true);
+   ArraySetAsSeries(SweepHighBuffer, true);
+   ArraySetAsSeries(SweepLowBuffer, true);
+   ArraySetAsSeries(BuySignalBuffer, true);
+   ArraySetAsSeries(SellSignalBuffer, true);
+
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Custom indicator deinitialization function                       |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   // More selective object deletion to preserve other indicators' objects
+   ObjectsDeleteAll(0, 0, OBJ_ARROW);
+   ObjectsDeleteAll(0, 0, OBJ_RECTANGLE);
+   ObjectsDeleteAll(0, 0, OBJ_TEXT);
+   ObjectsDeleteAll(0, 0, OBJ_HLINE);
+   ObjectsDeleteAll(0, "BoS_*");
+   ObjectsDeleteAll(0, "EQH_*");
+   ObjectsDeleteAll(0, "EQL_*");
+   ObjectsDeleteAll(0, "FVG_*");
+   ObjectsDeleteAll(0, "Sweep*");
+   ObjectsDeleteAll(0, "AsiaBox*");
+   ObjectsDeleteAll(0, "LondonBox*");
+   ObjectsDeleteAll(0, "NYBox*");
+}
+
+//+------------------------------------------------------------------+
+//| Custom indicator iteration function (Final Optimized Version)    |
+//+------------------------------------------------------------------+
+int OnCalculate(const int rates_total,
+                const int prev_calculated,
+                const datetime &time[],
+                const double &open[],
+                const double &high[],
+                const double &low[],
+                const double &close[],
+                const long &tick_volume[],
+                const long &volume[],
+                const int &spread[])
+{
+   //--- Enhanced error checking
+   if(prev_calculated < 0) return(0);
+   if(rates_total <= 0 || ArraySize(close) < rates_total) return(0);
+   if(BarsCalculated(0) < rates_total) return(0);
+   
+   //--- More efficient limit calculation
+   int limit = (prev_calculated == 0) ? rates_total - 2 : rates_total - prev_calculated + 1;
+   limit = MathMin(MathMax(limit, 1), rates_total - 1);
+
+   //--- Buffer initialization optimization
+   if(prev_calculated == 0)
+   {
+      InitializeAllBuffers();
+      // Need at least 3 bars for most calculations
+      if(rates_total < 3) return(rates_total);
+   }
+
+   //--- Main processing loop with improved efficiency
+   for(int i = limit; i >= 0 && !IsStopped(); i--)
+   {
+      //--- Robust data validation
+      if(!IsValidBarData(time[i], open[i], high[i], low[i], close[i]))
+         continue;
+
+      //--- Reset buffers more efficiently
+      ResetBarBuffers(i);
+
+      //--- Historical bars processing (anti-repaint)
+      if(i > 0)
+      {
+         ProcessHistoricalBars(i, time, open, high, low, close);
+      }
+      //--- Current bar processing (i=0)
+      else if(IsNewBar())
+      {
+         ProcessCurrentBar(i, high, low, close, time);
+         UpdateVisualBuffers(i, close);
+      }
+   }
+
+   return(rates_total);
+}
+
+// Helper function: Initialize all buffers
+void InitializeAllBuffers()
+{
+   ArrayInitialize(BuyBuffer, EMPTY_VALUE);
+   ArrayInitialize(SellBuffer, EMPTY_VALUE);
+   ArrayInitialize(BoSBuffer, 0);
+   ArrayInitialize(ChoCHBuffer, 0);
+   ArrayInitialize(EQHBuffer, 0);
+   ArrayInitialize(EQLBuffer, 0);
+   ArrayInitialize(SweepHighBuffer, 0);
+   ArrayInitialize(SweepLowBuffer, 0);
+}
+
+// Helper function: Check if bar data is valid
+bool IsValidBarData(datetime time, double open, double high, double low, double close)
+{
+   return (time > 0 && open > 0 && high > 0 && low > 0 && close > 0 && high >= low && high >= close && close >= low);
+}
+
+// Helper function: Reset buffers for single bar
+void ResetBarBuffers(int index)
+{
+   BuyBuffer[index] = EMPTY_VALUE;
+   SellBuffer[index] = EMPTY_VALUE;
+   BoSBuffer[index] = 0;
+   ChoCHBuffer[index] = 0;
+   EQHBuffer[index] = 0;
+   EQLBuffer[index] = 0;
+   SweepHighBuffer[index] = 0;
+   SweepLowBuffer[index] = 0;
+}
+
+//+------------------------------------------------------------------+
+//| Optimized Historical Bar Processing                              |
+//+------------------------------------------------------------------+
+void ProcessHistoricalBars(int i, const datetime &time[], const double &open[], 
+                         const double &high[], const double &low[], const double &close[])
+{
+   // Skip processing if it's the current bar (index 0)
+   if(i == 0) return;
+   
+   // Calculate once for all detection functions
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double tolerance = 10 * point;
+   
+   // 1. Market Structure Detection (Basic Trend)
+   DetectMarketStructure(i);
+   
+   // 2. Break of Structure Detection (More sensitive)
+   if(BoSBuffer[i-1] != 0) // Only check if previous bar had BoS
+   {
+      DetectBoS(i, high, low, time);
+   }
+   
+   // 3. Change of Character Detection (Requires confirmation)
+   if(ChoCHBuffer[i-1] != 0) // Only check if previous bar had ChoCH
+   {
+      DetectChoCH(i, high, low, close, open, time);
+   }
+   
+   // 4. Order Block Detection (Less frequent)
+   if(i % 2 == 0) // Check every other bar for performance
+   {
+      DetectOrderBlock(i, open, close, high, low, time);
+   }
+   
+   // 5. Fair Value Gap Detection
+   DetectFVG(i, high, low, time);
+   
+   // 6. Equal High/Low Detection (Cluster-based)
+   static int lastEQDetection = 0;
+   if(i < lastEQDetection - 10 || i > lastEQDetection + 10) // Check in zones
+   {
+      DetectEQH(i, high, low, time);
+      DetectEQL(i, high, low, time);
+      lastEQDetection = i;
+   }
+}
+
+// Helper function: Process current bar
+void ProcessCurrentBar(int i, const double &high[], const double &low[], 
+                      const double &close[], const datetime &time[])
+{
+   DetectSweepHigh(i, high);
+   DetectSweepLow(i, low);
+   CheckSniperEntry(i, close, high, low, time);
+   DrawSessionBoxes(time[0]);
+}
+
+// Helper function: Check for new bar
+bool IsNewBar()
+{
+   static datetime lastBarTime = 0;
+   datetime currentBarTime = iTime(_Symbol, _Period, 0);
+   if(lastBarTime != currentBarTime)
+   {
+      lastBarTime = currentBarTime;
+      return true;
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| UpdateVisualBuffers                                              |
+//+------------------------------------------------------------------+
+void UpdateVisualBuffers(int i, const double &close[]) // Tambahkan parameter close[]
+{
+   // Pastikan objek terhapus sebelum membuat baru
+   string prefix = "Sniper_"+IntegerToString(i)+"_";
+   ObjectsDeleteAll(0, prefix);
+   
+   // Dapatkan harga close untuk bar saat ini
+   double currentClose = close[i];
+   
+   // Update buffer panah sinyal
+   if(BoSBuffer[i] != 0)
+   {
+      string bosName = prefix+"BoS";
+      ObjectCreate(0, bosName, OBJ_ARROW, 0, iTime(NULL,0,i), BoSBuffer[i]);
+      ObjectSetInteger(0, bosName, OBJPROP_ARROWCODE, (BoSBuffer[i] > currentClose)?234:233);
+      ObjectSetInteger(0, bosName, OBJPROP_COLOR, (BoSBuffer[i] > currentClose)?clrRed:clrLime);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Struktur Pasar: HH/LL/BoS/ChoCH                                  |
+//+------------------------------------------------------------------+
+double prevHigh = 0, prevLow = 0;
+string trend = "";  // "bull" atau "bear"
+
+void DetectMarketStructure(const int index)
+{
+   if(index >= Bars(_Symbol, _Period)) return;
+
+   double currHigh = iHigh(_Symbol, _Period, index);
+   double currLow  = iLow(_Symbol, _Period, index);
+
+   if(prevHigh == 0 || prevLow == 0)
+   {
+      prevHigh = currHigh;
+      prevLow = currLow;
+      return;
+   }
+
+   // Tentukan trend berdasarkan struktur HH/LL
+   if(currHigh > prevHigh && currLow > prevLow)
+   {
+      if(trend == "bear")
+      {
+         DrawLabel(index, "ChoCH ↑", clrDeepSkyBlue);
+         trend = "bull";
+      }
+      else
+      {
+         DrawLabel(index, "BoS ↑", clrLime);
+         trend = "bull";
+      }
+   }
+   else if(currHigh < prevHigh && currLow < prevLow)
+   {
+      if(trend == "bull")
+      {
+         DrawLabel(index, "ChoCH ↓", clrOrangeRed);
+         trend = "bear";
+      }
+      else
+      {
+         DrawLabel(index, "BoS ↓", clrRed);
+         trend = "bear";
+      }
+   }
+
+   prevHigh = currHigh;
+   prevLow  = currLow;
+}
+
+void DrawLabel(int index, string text, color col)
+{
+   string name = "struct_" + IntegerToString(index) + "_" + text;
+   datetime time = iTime(_Symbol, _Period, index);
+   double price = iHigh(_Symbol, _Period, index) + 30 * _Point;
+
+   if(ObjectFind(0, name) < 0)
+   {
+      ObjectCreate(0, name, OBJ_TEXT, 0, time, price);
+      ObjectSetInteger(0, name, OBJPROP_COLOR, col);
+      ObjectSetInteger(0, name, OBJPROP_FONTSIZE, 10);
+      ObjectSetString(0, name, OBJPROP_TEXT, text);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Break of Structure (BoS) Detector                                |
+//+------------------------------------------------------------------+
+void DetectBoS(int i, const double &high[], const double &low[], const datetime &time[])
+{
+   if(i < 2 || i >= Bars(_Symbol, _Period)-1) return;
+
+   bool bullishBoS = low[i] < low[i + 1] && low[i] < low[i - 1];
+   bool bearishBoS = high[i] > high[i + 1] && high[i] > high[i - 1];
+
+   string nameBuy = "BoS_Buy_" + IntegerToString(i);
+   string nameSell = "BoS_Sell_" + IntegerToString(i);
+
+   if(bullishBoS)
+   {
+      if(ObjectFind(0, nameBuy) != -1) ObjectDelete(0, nameBuy);
+      ObjectCreate(0, nameBuy, OBJ_ARROW_UP, 0, time[i], low[i] - 10 * _Point);
+      ObjectSetInteger(0, nameBuy, OBJPROP_COLOR, clrLime);
+      ObjectSetInteger(0, nameBuy, OBJPROP_ARROWCODE, 233);
+      ObjectSetInteger(0, nameBuy, OBJPROP_WIDTH, 1);
+
+      BoSBuffer[i] = low[i] - 10 * _Point;
+   }
+
+   if(bearishBoS)
+   {
+      if(ObjectFind(0, nameSell) != -1) ObjectDelete(0, nameSell);
+      ObjectCreate(0, nameSell, OBJ_ARROW_DOWN, 0, time[i], high[i] + 10 * _Point);
+      ObjectSetInteger(0, nameSell, OBJPROP_COLOR, clrRed);
+      ObjectSetInteger(0, nameSell, OBJPROP_ARROWCODE, 234);
+      ObjectSetInteger(0, nameSell, OBJPROP_WIDTH, 1);
+
+      BoSBuffer[i] = high[i] + 10 * _Point;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Fungsi: Deteksi Order Block Otomatis                             |
+//+------------------------------------------------------------------+
+void DetectOrderBlock(int i, 
+                     const double &open[], 
+                     const double &close[], 
+                     const double &high[], 
+                     const double &low[],
+                     const datetime &time[])
+{
+   if(i < 2 || i >= Bars(_Symbol, _Period)-1) return;
+
+   // Bullish OB: candle bearish lalu candle bullish close di atas high sebelumnya
+   bool isBullishOB = close[i] < open[i] && close[i + 1] > open[i + 1] && close[i + 1] > high[i];
+
+   // Bearish OB: candle bullish lalu candle bearish close di bawah low sebelumnya
+   bool isBearishOB = close[i] > open[i] && close[i + 1] < open[i + 1] && close[i + 1] < low[i];
+
+   string obName = "OB_" + IntegerToString(i);
+
+   // Hapus objek jika sudah ada
+   if(ObjectFind(0, obName) != -1)
+      ObjectDelete(0, obName);
+
+   if(isBullishOB)
+   {
+      ObjectCreate(0, obName, OBJ_RECTANGLE, 0, time[i], high[i], time[i + 1], low[i]);
+      ObjectSetInteger(0, obName, OBJPROP_COLOR, clrGreen);
+      ObjectSetInteger(0, obName, OBJPROP_STYLE, STYLE_SOLID);
+      ObjectSetInteger(0, obName, OBJPROP_WIDTH, 1);
+      ObjectSetInteger(0, obName, OBJPROP_BACK, true);
+      ObjectSetInteger(0, obName, OBJPROP_RAY_RIGHT, true);
+   }
+
+   if(isBearishOB)
+   {
+      ObjectCreate(0, obName, OBJ_RECTANGLE, 0, time[i], low[i], time[i + 1], high[i]);
+      ObjectSetInteger(0, obName, OBJPROP_COLOR, clrRed);
+      ObjectSetInteger(0, obName, OBJPROP_STYLE, STYLE_SOLID);
+      ObjectSetInteger(0, obName, OBJPROP_WIDTH, 1);
+      ObjectSetInteger(0, obName, OBJPROP_BACK, true);
+      ObjectSetInteger(0, obName, OBJPROP_RAY_RIGHT, true);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Fungsi: Deteksi Fair Value Gap (FVG)                             |
+//+------------------------------------------------------------------+
+void DetectFVG(int i, const double &high[], const double &low[], const datetime &time[])
+{
+   if(i < 2 || i >= Bars(_Symbol, _Period)-2) return;
+
+   double high2 = high[i + 2];
+   double low0  = low[i];
+
+   // Kondisi FVG Bullish: candle i (low) > candle i+2 (high)
+   if(low0 > high2)
+   {
+      string fvgName = "FVG_" + IntegerToString(i);
+
+      if(ObjectFind(0, fvgName) != -1)
+         ObjectDelete(0, fvgName);
+
+      // Buat kotak FVG
+      if(ObjectCreate(0, fvgName, OBJ_RECTANGLE, 0, time[i + 2], high2, time[i], low0))
+      {
+         ObjectSetInteger(0, fvgName, OBJPROP_COLOR, clrGold);
+         ObjectSetInteger(0, fvgName, OBJPROP_STYLE, STYLE_DOT);
+         ObjectSetInteger(0, fvgName, OBJPROP_BACK, true);
+         ObjectSetInteger(0, fvgName, OBJPROP_WIDTH, 1);
+         ObjectSetInteger(0, fvgName, OBJPROP_RAY_RIGHT, true);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Fungsi: Deteksi Equal High (EQH)                                 |
+//+------------------------------------------------------------------+
+void DetectEQH(int i, const double &high[], const double &low[], const datetime &time[])
+{
+   if(i < 2 || i >= Bars(_Symbol, _Period)-1) return;
+
+   double tolerance = 10 * _Point;
+
+   // Equal High Detection
+   if(MathAbs(high[i] - high[i + 1]) <= tolerance)
+   {
+      EQHBuffer[i] = high[i] + 5 * _Point;
+
+      string eqhName = "EQH_" + IntegerToString(i);
+      if(ObjectFind(0, eqhName) != -1)
+         ObjectDelete(0, eqhName);
+
+      if(ObjectCreate(0, eqhName, OBJ_HLINE, 0, time[i], high[i]))
+      {
+         ObjectSetInteger(0, eqhName, OBJPROP_COLOR, clrOrangeRed);
+         ObjectSetInteger(0, eqhName, OBJPROP_WIDTH, 1);
+         ObjectSetInteger(0, eqhName, OBJPROP_STYLE, STYLE_DOT);
+         ObjectSetInteger(0, eqhName, OBJPROP_RAY_RIGHT, true);
+         ObjectSetInteger(0, eqhName, OBJPROP_BACK, true);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Deteksi Equal Low (EQL)                                          |
+//+------------------------------------------------------------------+
+void DetectEQL(int i, const double &high[], const double &low[], const datetime &time[])
+{
+   if(i < 2 || i >= Bars(_Symbol, _Period)-1) return;
+
+   double tolerance = 10 * _Point;
+
+   if(MathAbs(low[i] - low[i + 1]) <= tolerance)
+   {
+      EQLBuffer[i] = low[i] - 5 * _Point;
+
+      string eqlName = "EQL_" + IntegerToString(i);
+      if(ObjectFind(0, eqlName) != -1)
+         ObjectDelete(0, eqlName);
+
+      if(ObjectCreate(0, eqlName, OBJ_HLINE, 0, time[i], low[i]))
+      {
+         ObjectSetInteger(0, eqlName, OBJPROP_COLOR, clrDodgerBlue);
+         ObjectSetInteger(0, eqlName, OBJPROP_WIDTH, 1);
+         ObjectSetInteger(0, eqlName, OBJPROP_STYLE, STYLE_DOT);
+         ObjectSetInteger(0, eqlName, OBJPROP_RAY_RIGHT, true);
+         ObjectSetInteger(0, eqlName, OBJPROP_BACK, true);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Deteksi ChoCH (Change of Character)                              |
+//+------------------------------------------------------------------+
+void DetectChoCH(int i, 
+                const double &high[], 
+                const double &low[], 
+                const double &close[], 
+                const double &open[],
+                const datetime &time[])
+{
+   if(i < 5 || i >= Bars(_Symbol, _Period)-2) return;
+
+   bool bullishChoCH = false;
+   bool bearishChoCH = false;
+
+   // Trend turun → tiba-tiba bullish candle (HL + bull candle)
+   if(high[i] < high[i + 1] && low[i] > low[i + 1] && close[i] > open[i])
+      bullishChoCH = true;
+
+   // Trend naik → tiba-tiba bearish candle (LH + bear candle)
+   if(low[i] > low[i + 1] && high[i] < high[i + 1] && close[i] < open[i])
+      bearishChoCH = true;
+
+   string nameUp = "ChoCH_Bull_" + IntegerToString(i);
+   string nameDn = "ChoCH_Bear_" + IntegerToString(i);
+
+   if(bullishChoCH)
+   {
+      ChoCHBuffer[i] = low[i] - 10 * _Point;
+
+      if(ObjectFind(0, nameUp) != -1)
+         ObjectDelete(0, nameUp);
+
+      if(ObjectCreate(0, nameUp, OBJ_ARROW_UP, 0, time[i], ChoCHBuffer[i]))
+      {
+         ObjectSetInteger(0, nameUp, OBJPROP_COLOR, clrLime);
+         ObjectSetInteger(0, nameUp, OBJPROP_WIDTH, 1);
+         ObjectSetInteger(0, nameUp, OBJPROP_ARROWCODE, 233);
+      }
+   }
+
+   if(bearishChoCH)
+   {
+      ChoCHBuffer[i] = high[i] + 10 * _Point;
+
+      if(ObjectFind(0, nameDn) != -1)
+         ObjectDelete(0, nameDn);
+
+      if(ObjectCreate(0, nameDn, OBJ_ARROW_DOWN, 0, time[i], ChoCHBuffer[i]))
+      {
+         ObjectSetInteger(0, nameDn, OBJPROP_COLOR, clrRed);
+         ObjectSetInteger(0, nameDn, OBJPROP_WIDTH, 1);
+         ObjectSetInteger(0, nameDn, OBJPROP_ARROWCODE, 234);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Deteksi Sweep High - harga menembus EQH atau HH sebelumnya       |
+//+------------------------------------------------------------------+
+bool DetectSweepHigh(int i, const double &high[])
+{
+   if(i < 2 || i >= Bars(_Symbol, _Period)-20) return false;
+
+   bool isSweep = false;
+
+   for(int j = i + 1; j < i + 20 && j < Bars(_Symbol, _Period); j++)
+   {
+      if(EQHBuffer[j] != 0 && high[i] > EQHBuffer[j])
+      {
+         isSweep = true;
+         break;
+      }
+   }
+
+   if(isSweep)
+   {
+      string name = "SweepHigh_" + IntegerToString(i);
+      if(ObjectFind(0, name) != -1)
+         ObjectDelete(0, name);
+
+      if(ObjectCreate(0, name, OBJ_ARROW_DOWN, 0, iTime(_Symbol, _Period, i), high[i] + 10 * _Point))
+      {
+         ObjectSetInteger(0, name, OBJPROP_COLOR, clrMagenta);
+         ObjectSetInteger(0, name, OBJPROP_ARROWCODE, 234);
+         ObjectSetInteger(0, name, OBJPROP_WIDTH, 1);
+      }
+
+      SweepHighBuffer[i] = high[i] + 10 * _Point;
+      return true;
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Deteksi Sweep Low - harga menembus EQL atau LL sebelumnya        |
+//+------------------------------------------------------------------+
+bool DetectSweepLow(int i, const double &low[])
+{
+   if(i < 2 || i >= Bars(_Symbol, _Period)-20) return false;
+
+   bool isSweep = false;
+
+   for(int j = i + 1; j < i + 20 && j < Bars(_Symbol, _Period); j++)
+   {
+      if(EQLBuffer[j] != 0 && low[i] < EQLBuffer[j])
+      {
+         isSweep = true;
+         break;
+      }
+   }
+
+   if(isSweep)
+   {
+      string name = "SweepLow_" + IntegerToString(i);
+      if(ObjectFind(0, name) != -1)
+         ObjectDelete(0, name);
+
+      if(ObjectCreate(0, name, OBJ_ARROW_UP, 0, iTime(_Symbol, _Period, i), low[i] - 10 * _Point))
+      {
+         ObjectSetInteger(0, name, OBJPROP_COLOR, clrCyan);
+         ObjectSetInteger(0, name, OBJPROP_ARROWCODE, 233);
+         ObjectSetInteger(0, name, OBJPROP_WIDTH, 1);
+      }
+
+      SweepLowBuffer[i] = low[i] - 10 * _Point;
+      return true;
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Deteksi Sniper Entry (Buy/Sell) berbasis BoS, ChoCH, Sweep       |
+//+------------------------------------------------------------------+
+void CheckSniperEntry(int i,
+                     const double &close[],
+                     const double &high[],
+                     const double &low[],
+                     const datetime &time[])
+{
+   if(i < 10 || i >= Bars(_Symbol, _Period)-5) return;
+
+   bool isBoS = BoSBuffer[i] != 0;
+   bool isChoCH = ChoCHBuffer[i] != 0;
+   bool sweptLow = SweepLowBuffer[i] != 0;
+   bool sweptHigh = SweepHighBuffer[i] != 0;
+   double prevClose = close[i+1];
+
+   // ======== BUY SETUP ========
+   if(EnableSniperMode && isBoS && sweptLow && close[i] > prevClose)
+   {
+      double sl = low[i] - 30 * _Point;
+      double tp = close[i] + (RiskRR * (close[i] - sl));
+
+      BuyBuffer[i] = low[i] - 10 * _Point;
+
+      if(i == 0 && EnableAlerts)
+      {
+         string msg = StringFormat("BUY Signal %s TF:%s Price:%.5f SL:%.5f TP:%.5f",
+                     _Symbol, EnumToString(_Period), close[i], sl, tp);
+         Alert(msg);
+         if(EnablePushNotif) SendNotification(msg);
+      }
+   }
+
+   // ======== SELL SETUP ========
+   if(EnableSniperMode && isChoCH && sweptHigh && close[i] < prevClose)
+   {
+      double sl = high[i] + 30 * _Point;
+      double tp = close[i] - (RiskRR * (sl - close[i]));
+
+      SellBuffer[i] = high[i] + 10 * _Point;
+
+      if(i == 0 && EnableAlerts)
+      {
+         string msg = StringFormat("SELL Signal %s TF:%s Price:%.5f SL:%.5f TP:%.5f",
+                     _Symbol, EnumToString(_Period), close[i], sl, tp);
+         Alert(msg);
+         if(EnablePushNotif) SendNotification(msg);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Draw Market Session Boxes (Asia, London, NY)                     |
+//+------------------------------------------------------------------+
+void DrawSessionBoxes(datetime current)
+{
+   datetime today = current - (current % 86400); // normalize ke jam 00:00
+
+   datetime asiaStart   = today + 0 * 3600;   // 00:00
+   datetime londonStart = today + 8 * 3600;   // 08:00
+   datetime nyStart     = today + 13 * 3600;  // 13:00
+   datetime nyEnd       = today + 22 * 3600;  // 22:00
+
+   DrawBox("AsiaBox", asiaStart, londonStart, SessionBoxHeight, clrAliceBlue);
+   DrawBox("LondonBox", londonStart, nyStart, SessionBoxHeight, clrLavender);
+   DrawBox("NYBox", nyStart, nyEnd, SessionBoxHeight, clrMistyRose);
+}
+
+//+------------------------------------------------------------------+
+//| Box Rectangle Draw Function                                      |
+//+------------------------------------------------------------------+
+void DrawBox(string name, datetime time1, datetime time2, double height, color clr)
+{
+   double top = iHigh(_Symbol, _Period, 0);
+   double bottom = top - height * _Point;
+
+   if(ObjectFind(0, name) != -1)
+      ObjectDelete(0, name);
+
+   ObjectCreate(0, name, OBJ_RECTANGLE, 0, time1, top, time2, bottom);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, clr);
+   ObjectSetInteger(0, name, OBJPROP_STYLE, STYLE_SOLID);
+   ObjectSetInteger(0, name, OBJPROP_WIDTH, 1);
+   ObjectSetInteger(0, name, OBJPROP_BACK, true);
+}
